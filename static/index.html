@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Git風 Meeting Analyzer v3</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --border: #2a2d3e;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --accent: #6366f1;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #f59e0b;
+      --orange: #f97316;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Hiragino Sans', 'Yu Gothic', sans-serif;
+      font-size: 13px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── ヘッダー ── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    header h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.05em; }
+
+    .rec-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--muted);
+      transition: background 0.3s;
+    }
+    .rec-dot.active { background: var(--red); animation: pulse 1s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    .btn {
+      padding: 5px 14px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-start { background: var(--green); color: #fff; }
+    .btn-stop  { background: var(--red);   color: #fff; display: none; }
+
+    .goal-bar {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .goal-label { color: var(--muted); }
+    #goal-text {
+      color: var(--yellow);
+      font-weight: 600;
+      min-width: 80px;
+    }
+    .goal-pending { color: var(--muted); font-style: italic; }
+
+    #goal-input {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      padding: 3px 8px;
+      font-size: 12px;
+      width: 160px;
+      display: none;
+    }
+    .btn-edit { background: var(--border); color: var(--text); font-size: 11px; padding: 3px 8px; }
+
+    /* ── メインレイアウト ── */
+    .main-layout {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+      border-top: 1px solid var(--border);
+    }
+
+    /* ── テーブルコンテナ（4列分） ── */
+    .table-container {
+      flex: 1;
+      min-width: 0;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border);
+    }
+    .table-container::-webkit-scrollbar { width: 4px; }
+    .table-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .grid-header {
+      display: grid;
+      grid-template-columns: 80px minmax(0, 1fr) 120px 140px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      flex-shrink: 0;
+    }
+    .grid-header > div {
+      padding: 6px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      border-right: 1px solid var(--border);
+    }
+    .grid-header > div:last-child { border-right: none; }
+
+    /* ── 各発言行（4列グリッド） ── */
+    .speech-row {
+      display: grid;
+      grid-template-columns: 80px minmax(0, 1fr) 120px 140px;
+      border-bottom: 1px solid var(--border);
+      min-height: 40px;
+      transition: background 0.3s;
+    }
+    .speech-row.new { background: rgba(99,102,241,0.08); }
+
+    .speech-row > div {
+      padding: 8px 10px;
+      border-right: 1px solid var(--border);
+      font-size: 13px;
+      line-height: 1.5;
+      word-break: break-all;
+      display: flex;
+      align-items: flex-start;
+    }
+    .speech-row > div:last-child { border-right: none; }
+
+    /* ── フローパネル（右固定） ── */
+    .flow-panel {
+      width: 160px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .pane-header {
+      padding: 6px 10px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      flex-shrink: 0;
+    }
+
+    .pane-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+    .pane-body::-webkit-scrollbar { width: 4px; }
+    .pane-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* 後方互換 */
+    .row {
+      min-height: 40px;
+      line-height: 1.5;
+    }
+
+    /* 話者ペイン */
+    .speaker-tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 700;
+      background: var(--accent);
+      color: #fff;
+    }
+
+    /* 文字起こし */
+    .speech-text { color: var(--text); }
+
+    /* 要約・要望（遅延表示） */
+    .analysis-cell { color: var(--muted); font-size: 12px; }
+    .analysis-cell.filled { color: var(--text); }
+    .intent-list { list-style: none; padding: 0; }
+    .intent-list li::before { content: "・"; color: var(--accent); }
+
+    /* ── フローペイン（Git風） ── */
+    #flow-svg {
+      width: 100%;
+      min-height: 200px;
+    }
+
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="rec-dot" id="rec-dot"></div>
+  <h1>Git風 Meeting Analyzer v3</h1>
+  <button class="btn btn-start" id="btn-start" disabled>接続中...</button>
+  <button class="btn btn-stop"  id="btn-stop">■ 録音停止</button>
+
+  <div class="goal-bar">
+    <span class="goal-label">本題：</span>
+    <span id="goal-text" class="goal-pending">3分後に予測します</span>
+    <input id="goal-input" type="text" placeholder="本題を入力…" />
+    <button class="btn btn-edit" id="btn-edit-goal">✏️ 修正</button>
+  </div>
+</header>
+
+<div class="main-layout">
+  <!-- 左：4列グリッド（行揃え） -->
+  <div class="table-container" id="table-container">
+    <div class="grid-header">
+      <div>話者</div>
+      <div>文字起こし</div>
+      <div>要約</div>
+      <div>要望</div>
+    </div>
+    <div id="rows-container"></div>
+  </div>
+
+  <!-- 右：Git風フローパネル -->
+  <div class="flow-panel">
+    <div class="pane-header">話題の流れ</div>
+    <div class="pane-body" id="col-flow">
+      <svg id="flow-svg"></svg>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
