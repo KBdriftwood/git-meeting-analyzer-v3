@@ -1,29 +1,57 @@
+// ── デバッグ表示 ───────────────────────────────────────────
+function dbg(msg) {
+  const bar = document.getElementById('debug-bar');
+  bar.style.display = 'block';
+  bar.textContent = '[DEBUG] ' + msg;
+  console.log('[DEBUG]', msg);
+}
+
 // ── WebSocket接続 ──────────────────────────────────────────
-const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-const ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
+let ws = null;
+let pingInterval = null;
 
-ws.onopen = () => {
-  console.log("[WS] 接続完了");
-  btnStart.disabled = false;
-  btnStart.textContent = "● 録音開始";
-};
+function connectWS() {
+  dbg('WebSocket接続試行中...');
+  const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
 
-ws.onerror = (e) => {
-  console.error("[WS] エラー", e);
-  btnStart.textContent = "接続エラー";
-};
+  ws.onopen = () => {
+    dbg('WebSocket接続完了');
+    console.log("[WS] 接続完了");
+    btnStart.disabled = false;
+    btnStart.textContent = "● 録音開始";
+    pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ cmd: "ping" }));
+      }
+    }, 30000);
+  };
 
-ws.onclose = () => {
-  console.log("[WS] 切断 - 3秒後に再接続");
-  btnStart.disabled = true;
-  btnStart.textContent = "再接続中...";
-  setTimeout(() => location.reload(), 3000);
-};
+  ws.onerror = (e) => {
+    dbg('WebSocketエラー: ' + e.type);
+    console.error("[WS] エラー", e);
+  };
 
-ws.onmessage = (e) => handleEvent(JSON.parse(e.data));
+  ws.onclose = () => {
+    dbg('WebSocket切断 → 再接続');
+    console.log("[WS] 切断 - 3秒後に再接続");
+    clearInterval(pingInterval);
+    btnStart.disabled = true;
+    btnStart.textContent = "再接続中...";
+    setTimeout(connectWS, 3000);
+  };
+
+  ws.onmessage = (e) => {
+    const parsed = JSON.parse(e.data);
+    if (parsed.event !== 'pong') dbg('受信: ' + parsed.event);
+    handleEvent(parsed);
+  };
+}
+
+connectWS();
 
 function send(payload) {
-  if (ws.readyState !== WebSocket.OPEN) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
     console.warn("[WS] 接続が確立されていません");
     return;
   }
@@ -43,47 +71,110 @@ const btnEditGoal = document.getElementById("btn-edit-goal");
 
 // ── MediaRecorder 録音管理 ─────────────────────────────────
 let mediaRecorder = null;
+let audioChunks = [];
+let isRecordingActive = false;  // 連続録音中フラグ
+let currentStream = null;       // マイクストリーム（停止ボタンで解放）
+let chunkIntervalId = null;     // チャンク切り替えタイマー
+const CHUNK_DURATION_MS = 10000; // 10秒ごとに文字起こし送信
 
 async function startRecording() {
+  dbg('録音開始試行...');
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-    // ブラウザが対応しているMIMEタイプを選択
-    const mimeType = [
-      "audio/webm;codecs=opus",
-      "audio/webm",
-      "audio/ogg;codecs=opus",
-      "audio/ogg",
-    ].find((t) => MediaRecorder.isTypeSupported(t)) || "";
-
-    const options = mimeType ? { mimeType } : {};
-    mediaRecorder = new MediaRecorder(stream, options);
-
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          // "data:audio/webm;base64,XXXX..." → "XXXX..."
-          const base64 = reader.result.split(",")[1];
-          send({ cmd: "audio_chunk", data: base64 });
-        };
-        reader.readAsDataURL(e.data);
-      }
-    };
-
-    // 5秒ごとにチャンクをサーバーへ送信
-    mediaRecorder.start(5000);
+    dbg('マイク権限要求中...');
+    currentStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    dbg('マイク権限取得完了');
+    isRecordingActive = true;
     send({ cmd: "start" });
+    startNewChunk();
+
+    // 10秒ごとに現在のチャンクを締め切る → onstop で次が始まる
+    chunkIntervalId = setInterval(() => {
+      if (isRecordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
+        dbg('チャンク切り替え（10秒経過）');
+        mediaRecorder.stop();  // onstop → 送信 → 次のチャンク開始
+      }
+    }, CHUNK_DURATION_MS);
+
+    dbg('連続録音ループ開始');
   } catch (err) {
-    alert("マイクへのアクセスが拒否されました: " + err.message);
+    dbg('エラー: ' + err.name + ' - ' + err.message);
+    console.error("マイクエラー:", err);
+    alert('録音エラー: ' + err.name + '\n' + err.message);
+    isRecordingActive = false;
   }
 }
 
+function startNewChunk() {
+  if (!isRecordingActive || !currentStream) return;
+
+  // Safari対応: サポートされているmimeTypeを自動検出
+  const mimeType = getSupportedMimeType();
+  const options = mimeType ? { mimeType } : {};
+
+  audioChunks = [];
+  mediaRecorder = new MediaRecorder(currentStream, options);
+  dbg('新チャンク開始: ' + (mimeType || 'デフォルト'));
+
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data.size > 0) {
+      audioChunks.push(e.data);
+    }
+  };
+
+  // 停止時に全チャンクを結合して一括送信（Safari mp4 の moov atom 問題を回避）
+  mediaRecorder.onstop = () => {
+    const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+    const ext = getExtension(mediaRecorder.mimeType);
+    dbg('チャンク送信: ' + Math.round(blob.size / 1024) + 'KB, ext=' + ext);
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64 = reader.result.split(',')[1];
+      send({ cmd: 'audio_chunk', data: base64, ext: ext });
+    };
+    reader.readAsDataURL(blob);
+
+    // 録音中なら次のチャンクをすぐ開始
+    if (isRecordingActive) {
+      startNewChunk();
+    }
+  };
+
+  mediaRecorder.start(1000);  // 1秒ごとにondataavailableを発火
+}
+
+function getSupportedMimeType() {
+  const types = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+    "audio/ogg;codecs=opus",
+    "audio/ogg",
+  ];
+  for (const type of types) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return "";
+}
+
+function getExtension(mimeType) {
+  if (mimeType.includes("mp4")) return "mp4";
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("webm")) return "webm";
+  return "webm";
+}
+
 function stopRecording() {
-  if (mediaRecorder) {
-    mediaRecorder.stop();
-    mediaRecorder.stream.getTracks().forEach((t) => t.stop());
-    mediaRecorder = null;
+  dbg('録音停止要求');
+  isRecordingActive = false;
+  clearInterval(chunkIntervalId);
+  chunkIntervalId = null;
+
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();  // 最後のチャンクを送信（onstopでisRecordingActive=falseなので次は開始しない）
+  }
+  if (currentStream) {
+    currentStream.getTracks().forEach((t) => t.stop());
+    currentStream = null;
   }
   send({ cmd: "stop" });
 }
