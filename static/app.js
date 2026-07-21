@@ -10,41 +10,85 @@ function dbg(msg) {
 // ── WebSocket接続 ──────────────────────────────────────────
 let ws = null;
 let pingInterval = null;
+let reconnectTimer = null;
+let wsState = "connecting"; // connecting | open | closed
+
+function showStatus(msg, isError = false) {
+  const bar = document.getElementById("status-bar");
+  if (!bar) return;
+  bar.style.display = "block";
+  bar.style.color = isError ? "#fca5a5" : "#94a3b8";
+  bar.textContent = msg;
+}
+
+function clearStatus() {
+  const bar = document.getElementById("status-bar");
+  if (bar) bar.style.display = "none";
+}
+
+function updateConnectionUI() {
+  if (isRecordingActive) return;
+  if (pendingMicRequest) {
+    btnStart.disabled = true;
+    btnStart.textContent = "マイク準備中...";
+    return;
+  }
+  if (wsState === "open") {
+    btnStart.disabled = false;
+    btnStart.textContent = "● 録音開始";
+    clearStatus();
+  } else {
+    btnStart.disabled = true;
+    btnStart.textContent = wsState === "closed" ? "再接続中..." : "接続中...";
+  }
+}
 
 function connectWS() {
-  dbg('WebSocket接続試行中...');
+  dbg("WebSocket接続試行中...");
+  wsState = "connecting";
+  updateConnectionUI();
+
   const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
 
   ws.onopen = () => {
-    dbg('WebSocket接続完了');
+    dbg("WebSocket接続完了");
     console.log("[WS] 接続完了");
-    btnStart.disabled = false;
-    btnStart.textContent = "● 録音開始";
+    wsState = "open";
+    updateConnectionUI();
     pingInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ cmd: "ping" }));
       }
-    }, 30000);
+    }, 15000);
+    if (isRecordingActive) {
+      dbg("録音中に再接続 — startを再送");
+      send({ cmd: "start" });
+    }
   };
 
   ws.onerror = (e) => {
-    dbg('WebSocketエラー: ' + e.type);
+    dbg("WebSocketエラー: " + e.type);
     console.error("[WS] エラー", e);
   };
 
   ws.onclose = () => {
-    dbg('WebSocket切断 → 再接続');
+    dbg("WebSocket切断 → 再接続");
     console.log("[WS] 切断 - 3秒後に再接続");
     clearInterval(pingInterval);
-    btnStart.disabled = true;
-    btnStart.textContent = "再接続中...";
-    setTimeout(connectWS, 3000);
+    wsState = "closed";
+    if (!pendingMicRequest && !isRecordingActive) {
+      updateConnectionUI();
+    } else {
+      showStatus("接続が一時切断されました。自動で再接続します…");
+    }
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connectWS, 3000);
   };
 
   ws.onmessage = (e) => {
     const parsed = JSON.parse(e.data);
-    if (parsed.event !== 'pong') dbg('受信: ' + parsed.event);
+    if (parsed.event !== "pong") dbg("受信: " + parsed.event);
     handleEvent(parsed);
   };
 }
@@ -53,10 +97,30 @@ connectWS();
 
 function send(payload) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    console.warn("[WS] 接続が確立されていません");
-    return;
+    console.warn("[WS] 接続が確立されていません", payload);
+    return false;
   }
   ws.send(JSON.stringify(payload));
+  return true;
+}
+
+function ensureWSConnected(timeoutMs = 15000) {
+  if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        resolve(true);
+        return;
+      }
+      if (Date.now() - start >= timeoutMs) {
+        resolve(false);
+        return;
+      }
+      setTimeout(tick, 200);
+    };
+    tick();
+  });
 }
 
 // ── 状態管理 ───────────────────────────────────────────────
@@ -74,36 +138,79 @@ const btnEditGoal = document.getElementById("btn-edit-goal");
 let mediaRecorder = null;
 let audioChunks = [];
 let isRecordingActive = false;  // 連続録音中フラグ
+let pendingMicRequest = false;  // マイク許可ダイアログ表示中
 let currentStream = null;       // マイクストリーム（停止ボタンで解放）
 let chunkIntervalId = null;     // チャンク切り替えタイマー
 let chunkRestartTimer = null;   // 次チャンク開始のフォールバック
 const CHUNK_DURATION_MS = 10000; // 10秒ごとに文字起こし送信
 const MIN_CHUNK_BYTES = 2000;    // サーバーと同じ最小サイズ
 
+function setRecordingUI(recording) {
+  recDot.classList.toggle("active", recording);
+  btnStart.style.display = recording ? "none" : "inline-block";
+  btnStop.style.display = recording ? "inline-block" : "none";
+  if (!recording) updateConnectionUI();
+}
+
+function micErrorMessage(err) {
+  if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+    return "マイクの使用が拒否されました。ブラウザ設定でマイクを許可してください。";
+  }
+  if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+    return "マイクが見つかりません。デバイスを確認してください。";
+  }
+  if (err.name === "NotReadableError" || err.name === "TrackStartError") {
+    return "マイクが他のアプリで使用中の可能性があります。";
+  }
+  return `${err.name}: ${err.message}`;
+}
+
 async function startRecording() {
-  dbg('録音開始試行...');
+  if (pendingMicRequest || isRecordingActive) return;
+  dbg("録音開始試行...");
+  pendingMicRequest = true;
+  updateConnectionUI();
+
   try {
-    dbg('マイク権限要求中...');
+    dbg("マイク権限要求中...");
     currentStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    dbg('マイク権限取得完了');
+    pendingMicRequest = false;
+    dbg("マイク権限取得完了");
+
+    const connected = await ensureWSConnected();
+    if (!connected) {
+      throw new Error("サーバー接続が切れています。ページを再読み込みしてください。");
+    }
+
     isRecordingActive = true;
-    send({ cmd: "start" });
+    setRecordingUI(true);
+    clearStatus();
+
+    if (!send({ cmd: "start" })) {
+      throw new Error("録音開始コマンドの送信に失敗しました。");
+    }
     startNewChunk();
 
-    // 10秒ごとに現在のチャンクを締め切る → onstop で次が始まる
     chunkIntervalId = setInterval(() => {
-      if (isRecordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
-        dbg('チャンク切り替え（10秒経過）');
-        flushAndStopRecorder();  // onstop → 送信 → 次のチャンク開始
+      if (isRecordingActive && mediaRecorder && mediaRecorder.state === "recording") {
+        dbg("チャンク切り替え（10秒経過）");
+        flushAndStopRecorder();
       }
     }, CHUNK_DURATION_MS);
 
-    dbg('連続録音ループ開始');
+    dbg("連続録音ループ開始");
   } catch (err) {
-    dbg('エラー: ' + err.name + ' - ' + err.message);
-    console.error("マイクエラー:", err);
-    alert('録音エラー: ' + err.name + '\n' + err.message);
+    pendingMicRequest = false;
     isRecordingActive = false;
+    if (currentStream) {
+      currentStream.getTracks().forEach((t) => t.stop());
+      currentStream = null;
+    }
+    setRecordingUI(false);
+    const msg = micErrorMessage(err);
+    dbg("エラー: " + msg);
+    console.error("録音エラー:", err);
+    showStatus(msg, true);
   }
 }
 
@@ -234,6 +341,8 @@ function getExtension(mimeType) {
 function stopRecording() {
   dbg('録音停止要求');
   isRecordingActive = false;
+  setRecordingUI(false);
+  clearStatus();
   clearInterval(chunkIntervalId);
   chunkIntervalId = null;
   clearTimeout(chunkRestartTimer);
@@ -286,14 +395,21 @@ function handleEvent({ event, data }) {
 }
 
 function handleError({ message }) {
-  dbg('サーバーエラー: ' + message);
-  console.error('[Server]', message);
+  dbg("サーバーエラー: " + message);
+  console.error("[Server]", message);
+  showStatus("サーバーエラー: " + message, true);
 }
 
 function handleStatus({ recording }) {
-  recDot.classList.toggle("active", recording);
-  btnStart.style.display = recording ? "none"   : "inline-block";
-  btnStop.style.display  = recording ? "inline-block" : "none";
+  if (isRecordingActive && !recording) {
+    dbg("サーバー側が未録音 — startを再送");
+    send({ cmd: "start" });
+    setRecordingUI(true);
+    return;
+  }
+  if (!isRecordingActive && !pendingMicRequest) {
+    setRecordingUI(recording);
+  }
 }
 
 function handleSpeech({ speech_id, speaker, text }) {

@@ -140,12 +140,34 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             msg = await websocket.receive_text()
-            data = json.loads(msg)
-            await handle_client_message(data, websocket)
+            try:
+                data = json.loads(msg)
+                await handle_client_message(data, websocket)
+            except json.JSONDecodeError as e:
+                print(f"[Main] JSON解析エラー: {e}")
+                await websocket.send_text(
+                    json.dumps({"event": "error", "data": {"message": "不正なメッセージ形式"}}, ensure_ascii=False)
+                )
+            except Exception as e:
+                print(f"[Main] メッセージ処理エラー: {e}")
+                await websocket.send_text(
+                    json.dumps({"event": "error", "data": {"message": str(e)}}, ensure_ascii=False)
+                )
     except WebSocketDisconnect:
         if websocket in connected_clients:
             connected_clients.remove(websocket)
-        _reset_recording_if_idle()
+        asyncio.create_task(_delayed_reset_recording())
+    except Exception as e:
+        print(f"[Main] WebSocketエラー: {e}")
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
+        asyncio.create_task(_delayed_reset_recording())
+
+
+async def _delayed_reset_recording():
+    """モバイルの一時切断を考慮し、30秒後に録音状態をリセットする"""
+    await asyncio.sleep(30)
+    _reset_recording_if_idle()
 
 
 def _reset_recording_if_idle():
