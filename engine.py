@@ -1,7 +1,7 @@
 import base64
 import os
 import tempfile
-from groq import Groq
+from groq_client import get_groq_client
 
 MIME_BY_EXT = {
     "webm": "audio/webm",
@@ -42,7 +42,7 @@ def transcribe_audio(audio_data_b64: str, ext: str = "webm") -> str:
         tmp_path = f.name
 
     try:
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        client = get_groq_client()
         with open(tmp_path, "rb") as f:
             result = client.audio.transcriptions.create(
                 file=(f"audio.{ext}", f, mime_type),

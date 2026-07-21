@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 
 from engine import transcribe_audio
 from analyzer import Analyzer
+from groq_client import get_groq_api_key
 from database import (
     init_db,
     get_or_create_speaker,
@@ -116,6 +117,11 @@ async def transcribe_and_process(audio_data_b64: str, ext: str = "webm"):
 async def lifespan(app: FastAPI):
     global loop
     init_db()
+    try:
+        get_groq_api_key()
+        print("[Main] GROQ_API_KEY を確認しました")
+    except RuntimeError as e:
+        print(f"[Main] 警告: {e}")
     loop = asyncio.get_running_loop()
     yield
 

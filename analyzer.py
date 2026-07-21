@@ -1,11 +1,10 @@
-import os
 import json
 import re
 import time
 import threading
 import traceback
 import queue
-from openai import OpenAI
+from groq_client import get_groq_client
 from database import (
     update_speech_analysis,
     save_topic,
@@ -25,10 +24,7 @@ class Analyzer:
         on_goal_callback(goal)                             : 本題予測確定時
         on_topic_callback(topic_node)                     : 話題ノード追加時
         """
-        self.client = OpenAI(
-            api_key=os.getenv("GROQ_API_KEY"),
-            base_url="https://api.groq.com/openai/v1"
-        )
+        self.client = get_groq_client()
         self.model = "llama-3.3-70b-versatile"
         self.on_analysis_callback = on_analysis_callback
         self.on_goal_callback = on_goal_callback

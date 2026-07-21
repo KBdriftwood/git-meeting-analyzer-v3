@@ -8,9 +8,9 @@
 # 1. 依存パッケージをインストール
 pip install -r requirements.txt
 
-# 2. OpenAI APIキーを設定
+# 2. Groq APIキーを設定
 cp .env.example .env
-# .env を編集して OPENAI_API_KEY を入力
+# .env を編集して GROQ_API_KEY を入力（https://console.groq.com/keys）
 
 # 3. サーバーを起動
 uvicorn main:app --reload
@@ -36,6 +36,16 @@ uvicorn main:app --reload
 | `database.py` | SQLite 操作（V2 ベース改良） |
 | `static/index.html` | 5ペイン UI |
 | `static/app.js` | フロントエンド制御 + SVG フロー描画 |
+
+## Railway へのデプロイ
+
+1. Railway ダッシュボードで対象サービスを開く
+2. **Variables** タブで環境変数を追加する
+   - 変数名: `GROQ_API_KEY`
+   - 値: Groq Console で発行した API キー
+3. デプロイを再実行する（変数追加後は自動再デプロイされる場合あり）
+
+`GROQ_API_KEY` が未設定の場合、録音開始時または音声チャンク送信時にサーバーエラーになります。
 
 ## V2 からの変化
 
