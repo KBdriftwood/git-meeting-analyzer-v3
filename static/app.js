@@ -1,9 +1,10 @@
 // ── デバッグ表示 ───────────────────────────────────────────
 function dbg(msg) {
+  console.log('[DEBUG]', msg);
   const bar = document.getElementById('debug-bar');
+  if (!bar) return;
   bar.style.display = 'block';
   bar.textContent = '[DEBUG] ' + msg;
-  console.log('[DEBUG]', msg);
 }
 
 // ── WebSocket接続 ──────────────────────────────────────────
@@ -75,7 +76,9 @@ let audioChunks = [];
 let isRecordingActive = false;  // 連続録音中フラグ
 let currentStream = null;       // マイクストリーム（停止ボタンで解放）
 let chunkIntervalId = null;     // チャンク切り替えタイマー
+let chunkRestartTimer = null;   // 次チャンク開始のフォールバック
 const CHUNK_DURATION_MS = 10000; // 10秒ごとに文字起こし送信
+const MIN_CHUNK_BYTES = 2000;    // サーバーと同じ最小サイズ
 
 async function startRecording() {
   dbg('録音開始試行...');
@@ -91,7 +94,7 @@ async function startRecording() {
     chunkIntervalId = setInterval(() => {
       if (isRecordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
         dbg('チャンク切り替え（10秒経過）');
-        mediaRecorder.stop();  // onstop → 送信 → 次のチャンク開始
+        flushAndStopRecorder();  // onstop → 送信 → 次のチャンク開始
       }
     }, CHUNK_DURATION_MS);
 
@@ -104,42 +107,107 @@ async function startRecording() {
   }
 }
 
+function scheduleNextChunk(delayMs = 0) {
+  clearTimeout(chunkRestartTimer);
+  if (!isRecordingActive) return;
+  chunkRestartTimer = setTimeout(() => {
+    if (isRecordingActive && (!mediaRecorder || mediaRecorder.state === 'inactive')) {
+      startNewChunk();
+    }
+  }, delayMs);
+}
+
+function flushAndStopRecorder() {
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+  try {
+    if (typeof mediaRecorder.requestData === 'function') {
+      mediaRecorder.requestData();
+    }
+  } catch (err) {
+    console.warn('[Recorder] requestData failed:', err);
+  }
+  mediaRecorder.stop();
+}
+
 function startNewChunk() {
   if (!isRecordingActive || !currentStream) return;
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    dbg('前チャンクがまだ停止中 — 待機');
+    scheduleNextChunk(200);
+    return;
+  }
 
   // Safari対応: サポートされているmimeTypeを自動検出
   const mimeType = getSupportedMimeType();
   const options = mimeType ? { mimeType } : {};
 
   audioChunks = [];
-  mediaRecorder = new MediaRecorder(currentStream, options);
-  dbg('新チャンク開始: ' + (mimeType || 'デフォルト'));
+  try {
+    mediaRecorder = new MediaRecorder(currentStream, options);
+  } catch (err) {
+    dbg('MediaRecorder作成失敗: ' + err.message);
+    console.error('[Recorder] create failed:', err);
+    scheduleNextChunk(500);
+    return;
+  }
+  dbg('新チャンク開始: ' + (mediaRecorder.mimeType || mimeType || 'デフォルト'));
 
   mediaRecorder.ondataavailable = (e) => {
-    if (e.data.size > 0) {
+    if (e.data && e.data.size > 0) {
       audioChunks.push(e.data);
     }
   };
 
+  mediaRecorder.onerror = (e) => {
+    const msg = e.error ? e.error.message : 'unknown';
+    dbg('MediaRecorderエラー: ' + msg);
+    console.error('[Recorder] error:', e.error || e);
+    scheduleNextChunk(500);
+  };
+
   // 停止時に全チャンクを結合して一括送信（Safari mp4 の moov atom 問題を回避）
   mediaRecorder.onstop = () => {
-    const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
-    const ext = getExtension(mediaRecorder.mimeType);
-    dbg('チャンク送信: ' + Math.round(blob.size / 1024) + 'KB, ext=' + ext);
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const base64 = reader.result.split(',')[1];
-      send({ cmd: 'audio_chunk', data: base64, ext: ext });
-    };
-    reader.readAsDataURL(blob);
+    const blobType = mediaRecorder.mimeType || mimeType || 'audio/webm';
+    const blob = new Blob(audioChunks, { type: blobType });
+    const ext = getExtension(blobType);
+    dbg('チャンク完成: ' + blob.size + ' bytes, ext=' + ext);
 
-    // 録音中なら次のチャンクをすぐ開始
+    // 録音継続中は FileReader 完了を待たず次チャンクを開始（無音区間を防ぐ）
     if (isRecordingActive) {
-      startNewChunk();
+      scheduleNextChunk(0);
+    }
+
+    if (blob.size >= MIN_CHUNK_BYTES) {
+      const reader = new FileReader();
+      reader.onerror = () => {
+        dbg('FileReaderエラー');
+        console.error('[Recorder] FileReader failed');
+      };
+      reader.onloadend = () => {
+        if (!reader.result) {
+          dbg('FileReader結果が空');
+          return;
+        }
+        const base64 = reader.result.split(',')[1];
+        if (base64) {
+          send({ cmd: 'audio_chunk', data: base64, ext: ext });
+        } else {
+          dbg('base64変換失敗');
+        }
+      };
+      reader.readAsDataURL(blob);
+    } else {
+      dbg('チャンクが小さすぎるためスキップ (' + blob.size + ' bytes)');
     }
   };
 
-  mediaRecorder.start(1000);  // 1秒ごとにondataavailableを発火
+  try {
+    mediaRecorder.start(1000);  // 1秒ごとにondataavailableを発火
+  } catch (err) {
+    dbg('MediaRecorder.start失敗: ' + err.message);
+    console.error('[Recorder] start failed:', err);
+    scheduleNextChunk(500);
+  }
 }
 
 function getSupportedMimeType() {
@@ -168,9 +236,11 @@ function stopRecording() {
   isRecordingActive = false;
   clearInterval(chunkIntervalId);
   chunkIntervalId = null;
+  clearTimeout(chunkRestartTimer);
+  chunkRestartTimer = null;
 
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();  // 最後のチャンクを送信（onstopでisRecordingActive=falseなので次は開始しない）
+    flushAndStopRecorder();  // 最後のチャンクを送信（onstopでisRecordingActive=falseなので次は開始しない）
   }
   if (currentStream) {
     currentStream.getTracks().forEach((t) => t.stop());
@@ -210,7 +280,14 @@ function handleEvent({ event, data }) {
     case "analysis":  handleAnalysis(data); break;
     case "goal":      handleGoal(data);     break;
     case "topics":    handleTopics(data);   break;
+    case "error":     handleError(data);    break;
+    case "pong":      break;
   }
+}
+
+function handleError({ message }) {
+  dbg('サーバーエラー: ' + message);
+  console.error('[Server]', message);
 }
 
 function handleStatus({ recording }) {

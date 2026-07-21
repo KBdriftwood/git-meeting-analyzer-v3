@@ -75,7 +75,7 @@ def on_topic(topic_tree: list):
     )
 
 
-async def transcribe_and_process(audio_data_b64: str):
+async def transcribe_and_process(audio_data_b64: str, ext: str = "webm"):
     """
     ブラウザから受け取った base64 音声を Groq Whisper で文字起こしし、
     DBに保存してフロントエンドへ配信する。
@@ -84,13 +84,15 @@ async def transcribe_and_process(audio_data_b64: str):
 
     try:
         text = await asyncio.get_event_loop().run_in_executor(
-            None, transcribe_audio, audio_data_b64
+            None, transcribe_audio, audio_data_b64, ext
         )
     except Exception as e:
-        print(f"[Main] 文字起こし失敗: {e}")
+        print(f"[Main] 文字起こし失敗 ({ext}): {e}")
+        await broadcast("error", {"message": f"文字起こし失敗: {e}"})
         return
 
     if not text:
+        print(f"[Main] 文字起こし結果が空 ({ext})")
         return
 
     speech_id = save_speech(
@@ -131,17 +133,31 @@ async def index():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     connected_clients.append(websocket)
+    # 再接続時に現在の録音状態を同期
+    await websocket.send_text(
+        json.dumps({"event": "status", "data": {"recording": is_recording}}, ensure_ascii=False)
+    )
     try:
         while True:
             msg = await websocket.receive_text()
             data = json.loads(msg)
-            await handle_client_message(data)
+            await handle_client_message(data, websocket)
     except WebSocketDisconnect:
         if websocket in connected_clients:
             connected_clients.remove(websocket)
+        _reset_recording_if_idle()
 
 
-async def handle_client_message(data: dict):
+def _reset_recording_if_idle():
+    """接続クライアントがいなくなったら録音状態をリセットする"""
+    global is_recording, analyzer
+    if not connected_clients and is_recording:
+        is_recording = False
+        analyzer = None
+        print("[Main] 全クライアント切断 — 録音状態をリセット")
+
+
+async def handle_client_message(data: dict, websocket: WebSocket):
     """フロントからのコマンドを処理する"""
     global analyzer, is_recording, session_speaker_id, parent_speech_id
     cmd = data.get("cmd")
@@ -169,8 +185,22 @@ async def handle_client_message(data: dict):
     elif cmd == "audio_chunk":
         if is_recording:
             audio_data_b64 = data.get("data", "")
+            ext = data.get("ext", "webm")
             if audio_data_b64:
-                asyncio.create_task(transcribe_and_process(audio_data_b64))
+                print(f"[Main] audio_chunk受信: ext={ext}, size={len(audio_data_b64)} chars")
+                asyncio.create_task(transcribe_and_process(audio_data_b64, ext))
+            else:
+                print("[Main] audio_chunk: 空データを無視")
+        else:
+            print("[Main] audio_chunk: 録音中ではないため無視")
+
+    elif cmd == "ping":
+        try:
+            await websocket.send_text(
+                json.dumps({"event": "pong", "data": {}}, ensure_ascii=False)
+            )
+        except Exception:
+            pass
 
     elif cmd == "set_goal":
         goal = data.get("goal", "").strip()

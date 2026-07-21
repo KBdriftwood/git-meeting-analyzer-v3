@@ -219,6 +219,17 @@
       min-height: 200px;
     }
 
+    #debug-bar {
+      display: none;
+      padding: 4px 16px;
+      background: #1e293b;
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      font-family: monospace;
+      color: #94a3b8;
+      flex-shrink: 0;
+    }
+
   </style>
 </head>
 <body>
@@ -236,6 +247,8 @@
     <button class="btn btn-edit" id="btn-edit-goal">✏️ 修正</button>
   </div>
 </header>
+
+<div id="debug-bar"></div>
 
 <div class="main-layout">
   <!-- 左：4列グリッド（行揃え） -->
