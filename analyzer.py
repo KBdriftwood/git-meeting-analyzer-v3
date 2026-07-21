@@ -35,12 +35,24 @@ class Analyzer:
         self.goal_predicted = False
         self.start_time = time.time()
         self.current_topic_id = None
+        self._shutdown = False
 
         self._worker = threading.Thread(target=self._analysis_loop, daemon=True)
         self._worker.start()
 
+    def shutdown(self):
+        """セッション終了時にキューを破棄し、以降のDB更新・コールバックを止める"""
+        self._shutdown = True
+        while True:
+            try:
+                self.analysis_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def enqueue(self, speech_id: str, text: str):
         """発言を受け取り、30秒後に分析するようキューに積む"""
+        if self._shutdown:
+            return
         self.speech_log.append(text)
         self.analysis_queue.put((speech_id, text, time.time()))
 
@@ -57,6 +69,9 @@ class Analyzer:
             except queue.Empty:
                 continue
 
+            if self._shutdown:
+                continue
+
             print(f"[Analyzer] キューから取得: speech_id={speech_id}, text={text[:30]}...")
 
             # 遅延待機
@@ -65,6 +80,9 @@ class Analyzer:
                 print(f"[Analyzer] {wait:.1f}秒待機中...")
                 time.sleep(wait)
 
+            if self._shutdown:
+                continue
+
             print(f"[Analyzer] 分析開始: speech_id={speech_id}")
             try:
                 summary, intents = self._analyze_speech(text)
@@ -72,6 +90,9 @@ class Analyzer:
 
                 topic_label = self._classify_topic(text)
                 print(f"[Analyzer] 話題分類完了: topic_label={topic_label}")
+
+                if self._shutdown:
+                    continue
 
                 update_speech_analysis(speech_id, summary, json.dumps(intents, ensure_ascii=False))
 
@@ -158,6 +179,8 @@ class Analyzer:
 
     def _predict_goal(self):
         """3分間の発言から会議の本題を予測する"""
+        if self._shutdown:
+            return
         self.goal_predicted = True
         combined = "\n".join(self.speech_log[-20:])
 
@@ -173,6 +196,8 @@ class Analyzer:
                 messages=[{"role": "user", "content": prompt}],
             )
             goal = response.choices[0].message.content.strip()
+            if self._shutdown:
+                return
             set_meeting_goal(goal)
             self.on_goal_callback(goal)
         except Exception as e:

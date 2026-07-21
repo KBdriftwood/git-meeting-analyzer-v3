@@ -29,6 +29,7 @@ analyzer: Analyzer = None
 is_recording: bool = False
 session_speaker_id: str = None
 parent_speech_id: str = None
+session_token: int = 0
 loop = None  # asyncioイベントループ（lifespan内でセット）
 
 
@@ -45,9 +46,13 @@ async def broadcast(event: str, data: dict):
         connected_clients.remove(ws)
 
 
-def on_analysis(speech_id: str, summary: str, intents: list[str]):
+def _session_active(token: int) -> bool:
+    return loop is not None and is_recording and token == session_token
+
+
+def on_analysis(speech_id: str, summary: str, intents: list[str], *, _token: int):
     """要約・要望確定（遅延後）→ フロントへ配信"""
-    if loop is None or not is_recording:
+    if not _session_active(_token):
         return
     asyncio.run_coroutine_threadsafe(
         broadcast("analysis", {
@@ -59,9 +64,9 @@ def on_analysis(speech_id: str, summary: str, intents: list[str]):
     )
 
 
-def on_goal(goal: str):
+def on_goal(goal: str, *, _token: int):
     """本題予測確定 → フロントへ配信"""
-    if loop is None or not is_recording:
+    if not _session_active(_token):
         return
     asyncio.run_coroutine_threadsafe(
         broadcast("goal", {"goal": goal, "confirmed": False}),
@@ -69,9 +74,9 @@ def on_goal(goal: str):
     )
 
 
-def on_topic(topic_tree: list):
+def on_topic(topic_tree: list, *, _token: int):
     """話題ノード更新 → フロントへ配信"""
-    if loop is None or not is_recording:
+    if not _session_active(_token):
         return
     asyncio.run_coroutine_threadsafe(
         broadcast("topics", {"nodes": topic_tree}),
@@ -93,12 +98,28 @@ def _build_topic_tree() -> list:
 
 def _reset_session():
     """録音状態とDBをリセットする"""
-    global is_recording, analyzer, session_speaker_id, parent_speech_id
+    global is_recording, analyzer, session_speaker_id, parent_speech_id, session_token
     is_recording = False
+    if analyzer is not None:
+        analyzer.shutdown()
     analyzer = None
     session_speaker_id = None
     parent_speech_id = None
+    session_token += 1
     clear_session_data()
+
+
+def _make_analyzer_callbacks(token: int):
+    def on_analysis_cb(speech_id: str, summary: str, intents: list[str]):
+        on_analysis(speech_id, summary, intents, _token=token)
+
+    def on_goal_cb(goal: str):
+        on_goal(goal, _token=token)
+
+    def on_topic_cb(topic_tree: list):
+        on_topic(topic_tree, _token=token)
+
+    return on_analysis_cb, on_goal_cb, on_topic_cb
 
 
 async def _send_to_client(websocket: WebSocket, event: str, data: dict):
@@ -257,13 +278,15 @@ async def handle_client_message(data: dict, websocket: WebSocket):
             return
 
         _reset_session()
+        token = session_token
         session_speaker_id = f"spk_{str(uuid.uuid4())[:8]}"
         get_or_create_speaker(session_speaker_id, "参加者1")
         parent_speech_id = None
+        on_analysis_cb, on_goal_cb, on_topic_cb = _make_analyzer_callbacks(token)
         analyzer = Analyzer(
-            on_analysis_callback=on_analysis,
-            on_goal_callback=on_goal,
-            on_topic_callback=on_topic,
+            on_analysis_callback=on_analysis_cb,
+            on_goal_callback=on_goal_cb,
+            on_topic_callback=on_topic_cb,
         )
         is_recording = True
         await broadcast("status", {"recording": True})
