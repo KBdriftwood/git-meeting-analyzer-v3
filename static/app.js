@@ -7,11 +7,26 @@ function dbg(msg) {
   bar.textContent = '[DEBUG] ' + msg;
 }
 
+// ── 状態管理（WebSocket/UIより先に宣言） ───────────────────
+const rows = {};   // speech_id → DOM要素への参照
+let isRecordingActive = false;  // 連続録音中フラグ
+let pendingMicRequest = false;  // マイク許可ダイアログ表示中
+
+// ── UIコントロール ─────────────────────────────────────────
+const btnStart    = document.getElementById("btn-start");
+const btnStop     = document.getElementById("btn-stop");
+const recDot      = document.getElementById("rec-dot");
+const goalText    = document.getElementById("goal-text");
+const goalInput   = document.getElementById("goal-input");
+const btnEditGoal = document.getElementById("btn-edit-goal");
+
 // ── WebSocket接続 ──────────────────────────────────────────
 let ws = null;
 let pingInterval = null;
 let reconnectTimer = null;
-let wsState = "connecting"; // connecting | open | closed
+let connectTimeoutTimer = null;
+let wsState = "connecting"; // connecting | open | closed | failed
+const CONNECT_TIMEOUT_MS = 10000;
 
 function showStatus(msg, isError = false) {
   const bar = document.getElementById("status-bar");
@@ -27,7 +42,7 @@ function clearStatus() {
 }
 
 function updateConnectionUI() {
-  if (isRecordingActive) return;
+  if (!btnStart || isRecordingActive) return;
   if (pendingMicRequest) {
     btnStart.disabled = true;
     btnStart.textContent = "マイク準備中...";
@@ -37,6 +52,9 @@ function updateConnectionUI() {
     btnStart.disabled = false;
     btnStart.textContent = "● 録音開始";
     clearStatus();
+  } else if (wsState === "failed") {
+    btnStart.disabled = true;
+    btnStart.textContent = "接続失敗";
   } else {
     btnStart.disabled = true;
     btnStart.textContent = wsState === "closed" ? "再接続中..." : "接続中...";
@@ -47,6 +65,14 @@ function connectWS() {
   dbg("WebSocket接続試行中...");
   wsState = "connecting";
   updateConnectionUI();
+  clearTimeout(connectTimeoutTimer);
+  connectTimeoutTimer = setTimeout(() => {
+    if (wsState !== "open") {
+      wsState = "failed";
+      showStatus("サーバーに接続できません。ページを再読み込みしてください。", true);
+      updateConnectionUI();
+    }
+  }, CONNECT_TIMEOUT_MS);
 
   const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
@@ -54,6 +80,7 @@ function connectWS() {
   ws.onopen = () => {
     dbg("WebSocket接続完了");
     console.log("[WS] 接続完了");
+    clearTimeout(connectTimeoutTimer);
     wsState = "open";
     updateConnectionUI();
     pingInterval = setInterval(() => {
@@ -76,6 +103,8 @@ function connectWS() {
     dbg("WebSocket切断 → 再接続");
     console.log("[WS] 切断 - 3秒後に再接続");
     clearInterval(pingInterval);
+    clearTimeout(connectTimeoutTimer);
+    if (wsState === "failed") return;
     wsState = "closed";
     if (!pendingMicRequest && !isRecordingActive) {
       updateConnectionUI();
@@ -92,8 +121,6 @@ function connectWS() {
     handleEvent(parsed);
   };
 }
-
-connectWS();
 
 function send(payload) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -123,22 +150,9 @@ function ensureWSConnected(timeoutMs = 15000) {
   });
 }
 
-// ── 状態管理 ───────────────────────────────────────────────
-const rows = {};   // speech_id → DOM要素への参照
-
-// ── UIコントロール ─────────────────────────────────────────
-const btnStart    = document.getElementById("btn-start");
-const btnStop     = document.getElementById("btn-stop");
-const recDot      = document.getElementById("rec-dot");
-const goalText    = document.getElementById("goal-text");
-const goalInput   = document.getElementById("goal-input");
-const btnEditGoal = document.getElementById("btn-edit-goal");
-
 // ── MediaRecorder 録音管理 ─────────────────────────────────
 let mediaRecorder = null;
 let audioChunks = [];
-let isRecordingActive = false;  // 連続録音中フラグ
-let pendingMicRequest = false;  // マイク許可ダイアログ表示中
 let currentStream = null;       // マイクストリーム（停止ボタンで解放）
 let chunkIntervalId = null;     // チャンク切り替えタイマー
 let chunkRestartTimer = null;   // 次チャンク開始のフォールバック
@@ -360,6 +374,8 @@ function stopRecording() {
 
 btnStart.addEventListener("click", () => startRecording());
 btnStop.addEventListener("click",  () => stopRecording());
+
+connectWS();
 
 btnEditGoal.addEventListener("click", () => {
   if (goalInput.style.display === "none" || goalInput.style.display === "") {
