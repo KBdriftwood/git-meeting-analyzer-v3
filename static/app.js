@@ -62,6 +62,16 @@ function updateConnectionUI() {
 }
 
 function connectWS() {
+  if (location.protocol === "file:" || !location.host) {
+    wsState = "failed";
+    showStatus(
+      "HTMLを直接開いています。ターミナルで uvicorn main:app --reload を実行し、http://localhost:8000 を開いてください。",
+      true
+    );
+    updateConnectionUI();
+    return;
+  }
+
   dbg("WebSocket接続試行中...");
   wsState = "connecting";
   updateConnectionUI();
@@ -69,7 +79,10 @@ function connectWS() {
   connectTimeoutTimer = setTimeout(() => {
     if (wsState !== "open") {
       wsState = "failed";
-      showStatus("サーバーに接続できません。ページを再読み込みしてください。", true);
+      showStatus(
+        "サーバーに接続できません。ターミナルで uvicorn main:app --reload を実行してからページを再読み込みしてください。",
+        true
+      );
       updateConnectionUI();
     }
   }, CONNECT_TIMEOUT_MS);
@@ -372,8 +385,8 @@ function stopRecording() {
   send({ cmd: "stop" });
 }
 
-btnStart.addEventListener("click", () => startRecording());
-btnStop.addEventListener("click",  () => stopRecording());
+if (btnStart) btnStart.addEventListener("click", () => startRecording());
+if (btnStop) btnStop.addEventListener("click", () => stopRecording());
 
 connectWS();
 
