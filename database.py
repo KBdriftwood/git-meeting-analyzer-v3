@@ -157,3 +157,15 @@ def get_meeting_goal() -> str:
     row = cursor.fetchone()
     conn.close()
     return row[0] if row else None
+
+
+def clear_session_data():
+    """現在の会議セッションのデータをすべて削除する"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM speeches")
+    cursor.execute("DELETE FROM topics")
+    cursor.execute("DELETE FROM meeting_meta")
+    cursor.execute("DELETE FROM speakers")
+    conn.commit()
+    conn.close()

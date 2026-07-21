@@ -102,8 +102,10 @@ function connectWS() {
       }
     }, 15000);
     if (isRecordingActive) {
-      dbg("録音中に再接続 — startを再送");
-      send({ cmd: "start" });
+      dbg("録音中に再接続 — start(resume)を再送");
+      send({ cmd: "start", resume: true });
+    } else {
+      send({ cmd: "hello" });
     }
   };
 
@@ -418,6 +420,7 @@ function handleEvent({ event, data }) {
     case "analysis":  handleAnalysis(data); break;
     case "goal":      handleGoal(data);     break;
     case "topics":    handleTopics(data);   break;
+    case "session_reset": handleSessionReset(); break;
     case "error":     handleError(data);    break;
     case "pong":      break;
   }
@@ -431,8 +434,8 @@ function handleError({ message }) {
 
 function handleStatus({ recording }) {
   if (isRecordingActive && !recording) {
-    dbg("サーバー側が未録音 — startを再送");
-    send({ cmd: "start" });
+    dbg("サーバー側が未録音 — start(resume)を再送");
+    send({ cmd: "start", resume: true });
     setRecordingUI(true);
     return;
   }
@@ -483,6 +486,17 @@ function handleGoal({ goal, confirmed }) {
 
 function handleTopics({ nodes }) {
   renderFlow(nodes);
+}
+
+function handleSessionReset() {
+  document.getElementById("rows-container").innerHTML = "";
+  Object.keys(rows).forEach((k) => delete rows[k]);
+  renderFlow([]);
+  goalText.textContent = "3分後に予測します";
+  goalText.dataset.raw = "";
+  goalText.classList.add("goal-pending");
+  goalText.style.color = "";
+  goalInput.style.display = "none";
 }
 
 function esc(str) {

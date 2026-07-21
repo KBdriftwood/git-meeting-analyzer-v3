@@ -18,6 +18,9 @@ from database import (
     save_speech,
     set_meeting_goal,
     get_meeting_goal,
+    clear_session_data,
+    get_all_speeches,
+    get_all_topics,
 )
 
 # 接続中のWebSocketクライアント一覧
@@ -44,7 +47,7 @@ async def broadcast(event: str, data: dict):
 
 def on_analysis(speech_id: str, summary: str, intents: list[str]):
     """要約・要望確定（遅延後）→ フロントへ配信"""
-    if loop is None:
+    if loop is None or not is_recording:
         return
     asyncio.run_coroutine_threadsafe(
         broadcast("analysis", {
@@ -58,7 +61,7 @@ def on_analysis(speech_id: str, summary: str, intents: list[str]):
 
 def on_goal(goal: str):
     """本題予測確定 → フロントへ配信"""
-    if loop is None:
+    if loop is None or not is_recording:
         return
     asyncio.run_coroutine_threadsafe(
         broadcast("goal", {"goal": goal, "confirmed": False}),
@@ -68,12 +71,68 @@ def on_goal(goal: str):
 
 def on_topic(topic_tree: list):
     """話題ノード更新 → フロントへ配信"""
-    if loop is None:
+    if loop is None or not is_recording:
         return
     asyncio.run_coroutine_threadsafe(
         broadcast("topics", {"nodes": topic_tree}),
         loop,
     )
+
+
+def _build_topic_tree() -> list:
+    return [
+        {
+            "id": t[0],
+            "label": t[1],
+            "parent": t[2],
+            "digression": bool(t[3]),
+        }
+        for t in get_all_topics()
+    ]
+
+
+def _reset_session():
+    """録音状態とDBをリセットする"""
+    global is_recording, analyzer, session_speaker_id, parent_speech_id
+    is_recording = False
+    analyzer = None
+    session_speaker_id = None
+    parent_speech_id = None
+    clear_session_data()
+
+
+async def _send_to_client(websocket: WebSocket, event: str, data: dict):
+    await websocket.send_text(
+        json.dumps({"event": event, "data": data}, ensure_ascii=False)
+    )
+
+
+async def _replay_session_state(websocket: WebSocket):
+    """録音中の再接続クライアントへ現在のセッション状態を再送する"""
+    await _send_to_client(websocket, "status", {"recording": True})
+    await _send_to_client(websocket, "topics", {"nodes": _build_topic_tree()})
+
+    goal = get_meeting_goal()
+    if goal:
+        await _send_to_client(
+            websocket,
+            "goal",
+            {"goal": goal, "confirmed": analyzer.goal_predicted if analyzer else False},
+        )
+
+    for speech_id, speaker, text, _timestamp, summary, intents, _topic_id in get_all_speeches():
+        await _send_to_client(
+            websocket,
+            "speech",
+            {"speech_id": speech_id, "speaker": speaker, "text": text},
+        )
+        if summary:
+            intent_list = json.loads(intents) if intents else []
+            await _send_to_client(
+                websocket,
+                "analysis",
+                {"speech_id": speech_id, "summary": summary, "intents": intent_list},
+            )
 
 
 async def transcribe_and_process(audio_data_b64: str, ext: str = "webm"):
@@ -139,10 +198,6 @@ async def index():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     connected_clients.append(websocket)
-    # 再接続時に現在の録音状態を同期
-    await websocket.send_text(
-        json.dumps({"event": "status", "data": {"recording": is_recording}}, ensure_ascii=False)
-    )
     try:
         while True:
             msg = await websocket.receive_text()
@@ -178,10 +233,8 @@ async def _delayed_reset_recording():
 
 def _reset_recording_if_idle():
     """接続クライアントがいなくなったら録音状態をリセットする"""
-    global is_recording, analyzer
     if not connected_clients and is_recording:
-        is_recording = False
-        analyzer = None
+        _reset_session()
         print("[Main] 全クライアント切断 — 録音状態をリセット")
 
 
@@ -190,19 +243,32 @@ async def handle_client_message(data: dict, websocket: WebSocket):
     global analyzer, is_recording, session_speaker_id, parent_speech_id
     cmd = data.get("cmd")
 
-    if cmd == "start":
-        if not is_recording:
-            session_speaker_id = f"spk_{str(uuid.uuid4())[:8]}"
-            get_or_create_speaker(session_speaker_id, "参加者1")
-            parent_speech_id = None
-            analyzer = Analyzer(
-                on_analysis_callback=on_analysis,
-                on_goal_callback=on_goal,
-                on_topic_callback=on_topic,
-            )
-            is_recording = True
-            await broadcast("status", {"recording": True})
-            print("[Main] 録音セッション開始")
+    if cmd == "hello":
+        _reset_session()
+        await _send_to_client(websocket, "status", {"recording": False})
+        await _send_to_client(websocket, "session_reset", {})
+        print("[Main] ページ読み込み — セッションをリセット")
+
+    elif cmd == "start":
+        resume = data.get("resume", False)
+        if resume and is_recording:
+            await _replay_session_state(websocket)
+            print("[Main] 録音セッション再開（再接続）")
+            return
+
+        _reset_session()
+        session_speaker_id = f"spk_{str(uuid.uuid4())[:8]}"
+        get_or_create_speaker(session_speaker_id, "参加者1")
+        parent_speech_id = None
+        analyzer = Analyzer(
+            on_analysis_callback=on_analysis,
+            on_goal_callback=on_goal,
+            on_topic_callback=on_topic,
+        )
+        is_recording = True
+        await broadcast("status", {"recording": True})
+        await broadcast("session_reset", {})
+        print("[Main] 録音セッション開始")
 
     elif cmd == "stop":
         if is_recording:
