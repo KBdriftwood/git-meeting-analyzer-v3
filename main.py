@@ -21,6 +21,7 @@ from database import (
     clear_session_data,
     get_all_speeches,
     get_all_topics,
+    get_session_generation,
 )
 
 # 接続中のWebSocketクライアント一覧
@@ -30,6 +31,8 @@ is_recording: bool = False
 session_speaker_id: str = None
 parent_speech_id: str = None
 session_token: int = 0
+session_generation: int = 0
+active_session_id: str = None
 loop = None  # asyncioイベントループ（lifespan内でセット）
 
 
@@ -98,15 +101,24 @@ def _build_topic_tree() -> list:
 
 def _reset_session():
     """録音状態とDBをリセットする"""
-    global is_recording, analyzer, session_speaker_id, parent_speech_id, session_token
+    global is_recording, analyzer, session_speaker_id, parent_speech_id
+    global session_token, session_generation, active_session_id
     is_recording = False
     if analyzer is not None:
         analyzer.shutdown()
     analyzer = None
     session_speaker_id = None
     parent_speech_id = None
+    active_session_id = None
     session_token += 1
-    clear_session_data()
+    session_generation = clear_session_data()
+
+
+async def _send_empty_session_state(websocket: WebSocket):
+    """会話・話題フローを空にした状態をクライアントへ送る"""
+    await _send_to_client(websocket, "session_reset", {})
+    await _send_to_client(websocket, "topics", {"nodes": []})
+    await _send_to_client(websocket, "status", {"recording": False, "session_id": None})
 
 
 def _make_analyzer_callbacks(token: int):
@@ -130,7 +142,11 @@ async def _send_to_client(websocket: WebSocket, event: str, data: dict):
 
 async def _replay_session_state(websocket: WebSocket):
     """録音中の再接続クライアントへ現在のセッション状態を再送する"""
-    await _send_to_client(websocket, "status", {"recording": True})
+    await _send_to_client(
+        websocket,
+        "status",
+        {"recording": True, "session_id": active_session_id},
+    )
     await _send_to_client(websocket, "topics", {"nodes": _build_topic_tree()})
 
     goal = get_meeting_goal()
@@ -156,12 +172,21 @@ async def _replay_session_state(websocket: WebSocket):
             )
 
 
-async def transcribe_and_process(audio_data_b64: str, ext: str = "webm"):
+async def transcribe_and_process(
+    audio_data_b64: str,
+    ext: str = "webm",
+    *,
+    token: int,
+    generation: int,
+):
     """
     ブラウザから受け取った base64 音声を Groq Whisper で文字起こしし、
     DBに保存してフロントエンドへ配信する。
     """
     global parent_speech_id
+
+    if not _session_active(token) or generation != get_session_generation():
+        return
 
     try:
         text = await asyncio.get_event_loop().run_in_executor(
@@ -176,11 +201,18 @@ async def transcribe_and_process(audio_data_b64: str, ext: str = "webm"):
         print(f"[Main] 文字起こし結果が空 ({ext})")
         return
 
+    if not _session_active(token) or generation != get_session_generation():
+        return
+
     speech_id = save_speech(
         speaker_id=session_speaker_id,
         text=text,
         parent_id=parent_speech_id,
+        session_generation=generation,
     )
+    if speech_id is None:
+        return
+
     parent_speech_id = speech_id
 
     await broadcast("speech", {
@@ -189,7 +221,7 @@ async def transcribe_and_process(audio_data_b64: str, ext: str = "webm"):
         "text": text,
     })
 
-    if analyzer:
+    if analyzer and analyzer.session_generation == generation:
         analyzer.enqueue(speech_id, text)
 
 
@@ -262,23 +294,31 @@ def _reset_recording_if_idle():
 async def handle_client_message(data: dict, websocket: WebSocket):
     """フロントからのコマンドを処理する"""
     global analyzer, is_recording, session_speaker_id, parent_speech_id
+    global session_generation, active_session_id
     cmd = data.get("cmd")
 
     if cmd == "hello":
         _reset_session()
-        await _send_to_client(websocket, "status", {"recording": False})
-        await _send_to_client(websocket, "session_reset", {})
+        await _send_empty_session_state(websocket)
         print("[Main] ページ読み込み — セッションをリセット")
 
     elif cmd == "start":
         resume = data.get("resume", False)
-        if resume and is_recording:
+        client_session_id = data.get("session_id")
+        if (
+            resume
+            and is_recording
+            and active_session_id
+            and client_session_id == active_session_id
+        ):
             await _replay_session_state(websocket)
             print("[Main] 録音セッション再開（再接続）")
             return
 
         _reset_session()
         token = session_token
+        generation = session_generation
+        active_session_id = str(uuid.uuid4())
         session_speaker_id = f"spk_{str(uuid.uuid4())[:8]}"
         get_or_create_speaker(session_speaker_id, "参加者1")
         parent_speech_id = None
@@ -287,16 +327,21 @@ async def handle_client_message(data: dict, websocket: WebSocket):
             on_analysis_callback=on_analysis_cb,
             on_goal_callback=on_goal_cb,
             on_topic_callback=on_topic_cb,
+            session_generation=generation,
         )
         is_recording = True
-        await broadcast("status", {"recording": True})
         await broadcast("session_reset", {})
+        await broadcast("topics", {"nodes": []})
+        await broadcast(
+            "status",
+            {"recording": True, "session_id": active_session_id},
+        )
         print("[Main] 録音セッション開始")
 
     elif cmd == "stop":
         if is_recording:
             is_recording = False
-            await broadcast("status", {"recording": False})
+            await broadcast("status", {"recording": False, "session_id": active_session_id})
             print("[Main] 録音セッション停止")
 
     elif cmd == "audio_chunk":
@@ -305,7 +350,14 @@ async def handle_client_message(data: dict, websocket: WebSocket):
             ext = data.get("ext", "webm")
             if audio_data_b64:
                 print(f"[Main] audio_chunk受信: ext={ext}, size={len(audio_data_b64)} chars")
-                asyncio.create_task(transcribe_and_process(audio_data_b64, ext))
+                asyncio.create_task(
+                    transcribe_and_process(
+                        audio_data_b64,
+                        ext,
+                        token=session_token,
+                        generation=session_generation,
+                    )
+                )
             else:
                 print("[Main] audio_chunk: 空データを無視")
         else:
@@ -322,7 +374,7 @@ async def handle_client_message(data: dict, websocket: WebSocket):
     elif cmd == "set_goal":
         goal = data.get("goal", "").strip()
         if goal:
-            set_meeting_goal(goal)
+            set_meeting_goal(goal, session_generation=session_generation)
             if analyzer:
                 analyzer.goal_predicted = True
             await broadcast("goal", {"goal": goal, "confirmed": True})

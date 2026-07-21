@@ -11,6 +11,7 @@ function dbg(msg) {
 const rows = {};   // speech_id → DOM要素への参照
 let isRecordingActive = false;  // 連続録音中フラグ
 let pendingMicRequest = false;  // マイク許可ダイアログ表示中
+let activeSessionId = null;     // サーバー側の録音セッションID
 
 // ── UIコントロール ─────────────────────────────────────────
 const btnStart    = document.getElementById("btn-start");
@@ -101,9 +102,9 @@ function connectWS() {
         ws.send(JSON.stringify({ cmd: "ping" }));
       }
     }, 15000);
-    if (isRecordingActive) {
+    if (isRecordingActive && activeSessionId) {
       dbg("録音中に再接続 — start(resume)を再送");
-      send({ cmd: "start", resume: true });
+      send({ cmd: "start", resume: true, session_id: activeSessionId });
     } else {
       send({ cmd: "hello" });
     }
@@ -213,6 +214,7 @@ async function startRecording() {
 
     isRecordingActive = true;
     setRecordingUI(true);
+    clearSessionUI();
     clearStatus();
 
     if (!send({ cmd: "start" })) {
@@ -370,6 +372,7 @@ function getExtension(mimeType) {
 function stopRecording() {
   dbg('録音停止要求');
   isRecordingActive = false;
+  activeSessionId = null;
   setRecordingUI(false);
   clearStatus();
   clearInterval(chunkIntervalId);
@@ -432,11 +435,20 @@ function handleError({ message }) {
   showStatus("サーバーエラー: " + message, true);
 }
 
-function handleStatus({ recording }) {
+function handleStatus({ recording, session_id }) {
+  if (typeof session_id !== "undefined") {
+    activeSessionId = session_id || null;
+  }
+
   if (isRecordingActive && !recording) {
-    dbg("サーバー側が未録音 — start(resume)を再送");
-    send({ cmd: "start", resume: true });
-    setRecordingUI(true);
+    if (activeSessionId) {
+      dbg("サーバー側が未録音 — start(resume)を再送");
+      send({ cmd: "start", resume: true, session_id: activeSessionId });
+      setRecordingUI(true);
+    } else {
+      dbg("サーバー側が未録音 — 新規録音として再開");
+      send({ cmd: "start" });
+    }
     return;
   }
   if (!isRecordingActive && !pendingMicRequest) {
@@ -485,10 +497,10 @@ function handleGoal({ goal, confirmed }) {
 }
 
 function handleTopics({ nodes }) {
-  renderFlow(nodes);
+  renderFlow(Array.isArray(nodes) ? nodes : []);
 }
 
-function handleSessionReset() {
+function clearSessionUI() {
   document.getElementById("rows-container").innerHTML = "";
   Object.keys(rows).forEach((k) => delete rows[k]);
   renderFlow([]);
@@ -497,6 +509,13 @@ function handleSessionReset() {
   goalText.classList.add("goal-pending");
   goalText.style.color = "";
   goalInput.style.display = "none";
+}
+
+function handleSessionReset() {
+  clearSessionUI();
+  if (!isRecordingActive) {
+    activeSessionId = null;
+  }
 }
 
 function esc(str) {

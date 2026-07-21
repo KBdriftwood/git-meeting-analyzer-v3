@@ -4,6 +4,7 @@ import time
 import threading
 import traceback
 import queue
+from typing import Optional
 from groq_client import get_groq_client
 from database import (
     update_speech_analysis,
@@ -11,6 +12,7 @@ from database import (
     get_all_topics,
     set_meeting_goal,
     get_meeting_goal,
+    is_session_generation_active,
 )
 
 ANALYSIS_DELAY_SECONDS = 5    # デバッグ用（本番は30）
@@ -18,7 +20,14 @@ GOAL_PREDICTION_WINDOW = 30   # デバッグ用（本番は180秒）
 
 
 class Analyzer:
-    def __init__(self, on_analysis_callback, on_goal_callback, on_topic_callback):
+    def __init__(
+        self,
+        on_analysis_callback,
+        on_goal_callback,
+        on_topic_callback,
+        *,
+        session_generation: int,
+    ):
         """
         on_analysis_callback(speech_id, summary, intents) : 要約・要望確定時
         on_goal_callback(goal)                             : 本題予測確定時
@@ -29,6 +38,7 @@ class Analyzer:
         self.on_analysis_callback = on_analysis_callback
         self.on_goal_callback = on_goal_callback
         self.on_topic_callback = on_topic_callback
+        self.session_generation = session_generation
 
         self.analysis_queue = queue.Queue()  # (speech_id, text, enqueued_at)
         self.speech_log = []                 # 本題予測用バッファ
@@ -40,18 +50,22 @@ class Analyzer:
         self._worker = threading.Thread(target=self._analysis_loop, daemon=True)
         self._worker.start()
 
+    def _active(self) -> bool:
+        return (
+            not self._shutdown
+            and is_session_generation_active(self.session_generation)
+        )
+
     def shutdown(self):
         """セッション終了時にキューを破棄し、以降のDB更新・コールバックを止める"""
         self._shutdown = True
-        while True:
-            try:
-                self.analysis_queue.get_nowait()
-            except queue.Empty:
-                break
+        self.analysis_queue = queue.Queue()
+        self.speech_log.clear()
+        self.current_topic_id = None
 
     def enqueue(self, speech_id: str, text: str):
         """発言を受け取り、30秒後に分析するようキューに積む"""
-        if self._shutdown:
+        if not self._active():
             return
         self.speech_log.append(text)
         self.analysis_queue.put((speech_id, text, time.time()))
@@ -69,7 +83,7 @@ class Analyzer:
             except queue.Empty:
                 continue
 
-            if self._shutdown:
+            if not self._active():
                 continue
 
             print(f"[Analyzer] キューから取得: speech_id={speech_id}, text={text[:30]}...")
@@ -80,7 +94,7 @@ class Analyzer:
                 print(f"[Analyzer] {wait:.1f}秒待機中...")
                 time.sleep(wait)
 
-            if self._shutdown:
+            if not self._active():
                 continue
 
             print(f"[Analyzer] 分析開始: speech_id={speech_id}")
@@ -91,13 +105,20 @@ class Analyzer:
                 topic_label = self._classify_topic(text)
                 print(f"[Analyzer] 話題分類完了: topic_label={topic_label}")
 
-                if self._shutdown:
+                if not self._active():
                     continue
 
-                update_speech_analysis(speech_id, summary, json.dumps(intents, ensure_ascii=False))
+                if not update_speech_analysis(
+                    speech_id,
+                    summary,
+                    json.dumps(intents, ensure_ascii=False),
+                    session_generation=self.session_generation,
+                ):
+                    continue
 
                 # 話題ノードの更新
-                topic_id = self._update_topic_flow(topic_label)
+                if self._update_topic_flow(topic_label) is None:
+                    continue
 
                 print(f"[Analyzer] コールバック呼び出し: speech_id={speech_id}")
                 self.on_analysis_callback(speech_id, summary, intents)
@@ -139,12 +160,23 @@ class Analyzer:
         )
         return response.choices[0].message.content.strip()
 
-    def _update_topic_flow(self, topic_label: str) -> str:
+    def _update_topic_flow(self, topic_label: str) -> Optional[str]:
         """話題ノードをGit風に追加する"""
+        if not self._active():
+            return None
+
         topics = get_all_topics()
+        gen = self.session_generation
 
         if not topics:
-            topic_id = save_topic(topic_label, parent_id=None, is_digression=False)
+            topic_id = save_topic(
+                topic_label,
+                parent_id=None,
+                is_digression=False,
+                session_generation=gen,
+            )
+            if topic_id is None:
+                return None
             self.current_topic_id = topic_id
             return topic_id
 
@@ -152,12 +184,21 @@ class Analyzer:
         last_topic = topics[-1]
         last_label = last_topic[1]
 
+        if not self._active():
+            return None
+
         is_digression = self._is_digression(last_label, topic_label)
+        if not self._active():
+            return None
+
         topic_id = save_topic(
             topic_label,
             parent_id=self.current_topic_id,
-            is_digression=is_digression
+            is_digression=is_digression,
+            session_generation=gen,
         )
+        if topic_id is None:
+            return None
         self.current_topic_id = topic_id
         return topic_id
 
@@ -179,7 +220,7 @@ class Analyzer:
 
     def _predict_goal(self):
         """3分間の発言から会議の本題を予測する"""
-        if self._shutdown:
+        if not self._active():
             return
         self.goal_predicted = True
         combined = "\n".join(self.speech_log[-20:])
@@ -196,9 +237,10 @@ class Analyzer:
                 messages=[{"role": "user", "content": prompt}],
             )
             goal = response.choices[0].message.content.strip()
-            if self._shutdown:
+            if not self._active():
                 return
-            set_meeting_goal(goal)
+            if not set_meeting_goal(goal, session_generation=self.session_generation):
+                return
             self.on_goal_callback(goal)
         except Exception as e:
             print(f"[Analyzer] 本題予測エラー: {e}")
