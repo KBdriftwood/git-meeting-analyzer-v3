@@ -236,65 +236,68 @@ function releaseCaptureResources() {
   }
 }
 
-async function buildCaptureStream(includeTabAudio) {
+async function buildCaptureStream(includeTabAudio, displayPromise = null) {
   dbg(includeTabAudio ? "マイク＋タブ音声を取得中..." : "マイクのみ取得中...");
+
+  // getDisplayMedia はユーザー操作の直後に呼ぶ必要がある（先に await すると InvalidStateError）
+  let displayStream = null;
+  if (includeTabAudio) {
+    try {
+      displayStream = await (displayPromise || navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      }));
+    } catch (err) {
+      releaseCaptureResources();
+      throw err;
+    }
+    sourceStreams.push(displayStream);
+
+    // 映像は不要（ピッカー表示用）。音声トラックだけ残す
+    displayStream.getVideoTracks().forEach((t) => t.stop());
+
+    const tabAudioTracks = displayStream.getAudioTracks().filter((t) => t.readyState === "live");
+    if (!tabAudioTracks.length) {
+      releaseCaptureResources();
+      const e = new Error(
+        "TAB_AUDIO:タブの音声が含まれていません。共有ダイアログで YouTube のタブを選び、「タブの音声も共有」にチェックしてください。"
+      );
+      e.name = "TabAudioMissingError";
+      throw e;
+    }
+
+    tabAudioTracks.forEach((track) => {
+      track.addEventListener("ended", () => {
+        if (!isRecordingActive) return;
+        dbg("タブ共有が終了したため録音停止");
+        showStatus("タブ共有が終了したため録音を停止しました。", true);
+        stopRecording();
+      });
+    });
+
+    const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    sourceStreams.push(micStream);
+
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    const destination = audioContext.createMediaStreamDestination();
+    const micSource = audioContext.createMediaStreamSource(micStream);
+    micSource.connect(destination);
+
+    const tabStream = new MediaStream(tabAudioTracks);
+    const tabSource = audioContext.createMediaStreamSource(tabStream);
+    tabSource.connect(destination);
+
+    dbg("マイク＋タブ音声の混合完了");
+    return destination.stream;
+  }
 
   const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   sourceStreams.push(micStream);
-
-  if (!includeTabAudio) {
-    return micStream;
-  }
-
-  let displayStream;
-  try {
-    displayStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: true,
-    });
-  } catch (err) {
-    releaseCaptureResources();
-    throw err;
-  }
-  sourceStreams.push(displayStream);
-
-  // 映像は不要（ピッカー表示用）。音声トラックだけ残す
-  displayStream.getVideoTracks().forEach((t) => t.stop());
-
-  const tabAudioTracks = displayStream.getAudioTracks().filter((t) => t.readyState === "live");
-  if (!tabAudioTracks.length) {
-    releaseCaptureResources();
-    const e = new Error(
-      "TAB_AUDIO:タブの音声が含まれていません。共有ダイアログで YouTube のタブを選び、「タブの音声も共有」にチェックしてください。"
-    );
-    e.name = "TabAudioMissingError";
-    throw e;
-  }
-
-  tabAudioTracks.forEach((track) => {
-    track.addEventListener("ended", () => {
-      if (!isRecordingActive) return;
-      dbg("タブ共有が終了したため録音停止");
-      showStatus("タブ共有が終了したため録音を停止しました。", true);
-      stopRecording();
-    });
-  });
-
-  audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  if (audioContext.state === "suspended") {
-    await audioContext.resume();
-  }
-
-  const destination = audioContext.createMediaStreamDestination();
-  const micSource = audioContext.createMediaStreamSource(micStream);
-  micSource.connect(destination);
-
-  const tabStream = new MediaStream(tabAudioTracks);
-  const tabSource = audioContext.createMediaStreamSource(tabStream);
-  tabSource.connect(destination);
-
-  dbg("マイク＋タブ音声の混合完了");
-  return destination.stream;
+  return micStream;
 }
 
 async function startRecording() {
@@ -304,8 +307,25 @@ async function startRecording() {
   pendingMicRequest = true;
   updateConnectionUI();
 
+  // クリック操作の同期処理内で getDisplayMedia を開始する（ジェスチャ要件）
+  let displayPromise = null;
+  if (includeTabAudio) {
+    try {
+      displayPromise = navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
+    } catch (err) {
+      pendingMicRequest = false;
+      setRecordingUI(false);
+      const msg = captureErrorMessage(err, true);
+      showStatus(msg, true);
+      return;
+    }
+  }
+
   try {
-    currentStream = await buildCaptureStream(includeTabAudio);
+    currentStream = await buildCaptureStream(includeTabAudio, displayPromise);
     pendingMicRequest = false;
     dbg("音声キャプチャ準備完了");
 
