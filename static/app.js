@@ -20,6 +20,7 @@ const recDot      = document.getElementById("rec-dot");
 const goalText    = document.getElementById("goal-text");
 const goalInput   = document.getElementById("goal-input");
 const btnEditGoal = document.getElementById("btn-edit-goal");
+const includeTabAudioEl = document.getElementById("include-tab-audio");
 
 // ── WebSocket接続 ──────────────────────────────────────────
 let ws = null;
@@ -169,7 +170,9 @@ function ensureWSConnected(timeoutMs = 15000) {
 // ── MediaRecorder 録音管理 ─────────────────────────────────
 let mediaRecorder = null;
 let audioChunks = [];
-let currentStream = null;       // マイクストリーム（停止ボタンで解放）
+let currentStream = null;       // MediaRecorder に渡すストリーム（マイク or 混合）
+let sourceStreams = [];         // 解放用（マイク・タブ共有）
+let audioContext = null;        // マイク＋タブ混合用
 let chunkIntervalId = null;     // チャンク切り替えタイマー
 let chunkRestartTimer = null;   // 次チャンク開始のフォールバック
 const CHUNK_DURATION_MS = 10000; // 10秒ごとに文字起こし送信
@@ -179,6 +182,7 @@ function setRecordingUI(recording) {
   recDot.classList.toggle("active", recording);
   btnStart.style.display = recording ? "none" : "inline-block";
   btnStop.style.display = recording ? "inline-block" : "none";
+  if (includeTabAudioEl) includeTabAudioEl.disabled = recording;
   if (!recording) updateConnectionUI();
 }
 
@@ -195,17 +199,115 @@ function micErrorMessage(err) {
   return `${err.name}: ${err.message}`;
 }
 
+function captureErrorMessage(err, includeTabAudio) {
+  if (err && typeof err.message === "string" && err.message.startsWith("TAB_AUDIO:")) {
+    return err.message.replace(/^TAB_AUDIO:/, "");
+  }
+  if (includeTabAudio && (err.name === "NotAllowedError" || err.name === "PermissionDeniedError")) {
+    return "画面/タブ共有がキャンセルされました。YouTubeのタブを選び、「タブの音声も共有」にチェックしてください。";
+  }
+  if (includeTabAudio && err.name === "NotSupportedError") {
+    return "このブラウザはタブ音声の共有に対応していません。Chrome の利用を推奨します。";
+  }
+  return micErrorMessage(err);
+}
+
+function releaseCaptureResources() {
+  clearTimeout(chunkRestartTimer);
+  chunkRestartTimer = null;
+
+  if (audioContext) {
+    audioContext.close().catch(() => {});
+    audioContext = null;
+  }
+
+  sourceStreams.forEach((stream) => {
+    try {
+      stream.getTracks().forEach((t) => t.stop());
+    } catch (_) { /* ignore */ }
+  });
+  sourceStreams = [];
+
+  if (currentStream) {
+    try {
+      currentStream.getTracks().forEach((t) => t.stop());
+    } catch (_) { /* ignore */ }
+    currentStream = null;
+  }
+}
+
+async function buildCaptureStream(includeTabAudio) {
+  dbg(includeTabAudio ? "マイク＋タブ音声を取得中..." : "マイクのみ取得中...");
+
+  const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  sourceStreams.push(micStream);
+
+  if (!includeTabAudio) {
+    return micStream;
+  }
+
+  let displayStream;
+  try {
+    displayStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true,
+    });
+  } catch (err) {
+    releaseCaptureResources();
+    throw err;
+  }
+  sourceStreams.push(displayStream);
+
+  // 映像は不要（ピッカー表示用）。音声トラックだけ残す
+  displayStream.getVideoTracks().forEach((t) => t.stop());
+
+  const tabAudioTracks = displayStream.getAudioTracks().filter((t) => t.readyState === "live");
+  if (!tabAudioTracks.length) {
+    releaseCaptureResources();
+    const e = new Error(
+      "TAB_AUDIO:タブの音声が含まれていません。共有ダイアログで YouTube のタブを選び、「タブの音声も共有」にチェックしてください。"
+    );
+    e.name = "TabAudioMissingError";
+    throw e;
+  }
+
+  tabAudioTracks.forEach((track) => {
+    track.addEventListener("ended", () => {
+      if (!isRecordingActive) return;
+      dbg("タブ共有が終了したため録音停止");
+      showStatus("タブ共有が終了したため録音を停止しました。", true);
+      stopRecording();
+    });
+  });
+
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioContext.state === "suspended") {
+    await audioContext.resume();
+  }
+
+  const destination = audioContext.createMediaStreamDestination();
+  const micSource = audioContext.createMediaStreamSource(micStream);
+  micSource.connect(destination);
+
+  const tabStream = new MediaStream(tabAudioTracks);
+  const tabSource = audioContext.createMediaStreamSource(tabStream);
+  tabSource.connect(destination);
+
+  dbg("マイク＋タブ音声の混合完了");
+  return destination.stream;
+}
+
 async function startRecording() {
   if (pendingMicRequest || isRecordingActive) return;
-  dbg("録音開始試行...");
+  const includeTabAudio = !!(includeTabAudioEl && includeTabAudioEl.checked);
+  dbg(includeTabAudio ? "録音開始試行（マイク＋タブ）..." : "録音開始試行（マイクのみ）...");
   pendingMicRequest = true;
   updateConnectionUI();
 
   try {
-    dbg("マイク権限要求中...");
-    currentStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    currentStream = await buildCaptureStream(includeTabAudio);
     pendingMicRequest = false;
-    dbg("マイク権限取得完了");
+    dbg("音声キャプチャ準備完了");
 
     const connected = await ensureWSConnected();
     if (!connected) {
@@ -233,12 +335,9 @@ async function startRecording() {
   } catch (err) {
     pendingMicRequest = false;
     isRecordingActive = false;
-    if (currentStream) {
-      currentStream.getTracks().forEach((t) => t.stop());
-      currentStream = null;
-    }
+    releaseCaptureResources();
     setRecordingUI(false);
-    const msg = micErrorMessage(err);
+    const msg = captureErrorMessage(err, includeTabAudio);
     dbg("エラー: " + msg);
     console.error("録音エラー:", err);
     showStatus(msg, true);
@@ -377,16 +476,11 @@ function stopRecording() {
   clearStatus();
   clearInterval(chunkIntervalId);
   chunkIntervalId = null;
-  clearTimeout(chunkRestartTimer);
-  chunkRestartTimer = null;
 
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     flushAndStopRecorder();  // 最後のチャンクを送信（onstopでisRecordingActive=falseなので次は開始しない）
   }
-  if (currentStream) {
-    currentStream.getTracks().forEach((t) => t.stop());
-    currentStream = null;
-  }
+  releaseCaptureResources();
   send({ cmd: "stop" });
 }
 

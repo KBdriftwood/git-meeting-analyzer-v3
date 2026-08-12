@@ -69,6 +69,32 @@
     .btn-start { background: var(--green); color: #fff; }
     .btn-stop  { background: var(--red);   color: #fff; display: none; }
 
+    .capture-mode {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+      user-select: none;
+      white-space: nowrap;
+    }
+    .capture-mode input {
+      accent-color: var(--accent);
+      width: 14px;
+      height: 14px;
+      cursor: pointer;
+    }
+    .capture-mode input:disabled {
+      cursor: not-allowed;
+    }
+    .capture-mode label {
+      cursor: pointer;
+    }
+    .capture-mode input:disabled + label {
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+
     .goal-bar {
       margin-left: auto;
       display: flex;
@@ -249,6 +275,10 @@
   <h1>Git風 Meeting Analyzer v3</h1>
   <button class="btn btn-start" id="btn-start" disabled>接続中...</button>
   <button class="btn btn-stop"  id="btn-stop">■ 録音停止</button>
+  <div class="capture-mode" title="オフ＝マイクのみ（通常の会議）。オン＝マイク＋YouTubeなどのタブ音声">
+    <input type="checkbox" id="include-tab-audio" />
+    <label for="include-tab-audio">タブの音声も使う</label>
+  </div>
 
   <div class="goal-bar">
     <span class="goal-label">本題：</span>
