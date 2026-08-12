@@ -203,6 +203,9 @@ function captureErrorMessage(err, includeTabAudio) {
   if (err && typeof err.message === "string" && err.message.startsWith("TAB_AUDIO:")) {
     return err.message.replace(/^TAB_AUDIO:/, "");
   }
+  if (includeTabAudio && err && /user gesture|InvalidStateError/i.test(String(err.message || err.name || ""))) {
+    return "タブ共有はボタンクリック直後にだけ開始できます。ページを再読み込みしてから、もう一度「録音開始」を押してください。";
+  }
   if (includeTabAudio && (err.name === "NotAllowedError" || err.name === "PermissionDeniedError")) {
     return "画面/タブ共有がキャンセルされました。YouTubeのタブを選び、「タブの音声も共有」にチェックしてください。";
   }
@@ -239,14 +242,18 @@ function releaseCaptureResources() {
 async function buildCaptureStream(includeTabAudio, displayPromise = null) {
   dbg(includeTabAudio ? "マイク＋タブ音声を取得中..." : "マイクのみ取得中...");
 
-  // getDisplayMedia はユーザー操作の直後に呼ぶ必要がある（先に await すると InvalidStateError）
-  let displayStream = null;
   if (includeTabAudio) {
+    if (!displayPromise) {
+      const e = new Error(
+        "TAB_AUDIO:タブ共有を開始できませんでした。もう一度「録音開始」を押してください。"
+      );
+      e.name = "TabAudioMissingError";
+      throw e;
+    }
+
+    let displayStream;
     try {
-      displayStream = await (displayPromise || navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-      }));
+      displayStream = await displayPromise;
     } catch (err) {
       releaseCaptureResources();
       throw err;
@@ -300,29 +307,11 @@ async function buildCaptureStream(includeTabAudio, displayPromise = null) {
   return micStream;
 }
 
-async function startRecording() {
+async function startRecording(includeTabAudio, displayPromise) {
   if (pendingMicRequest || isRecordingActive) return;
-  const includeTabAudio = !!(includeTabAudioEl && includeTabAudioEl.checked);
   dbg(includeTabAudio ? "録音開始試行（マイク＋タブ）..." : "録音開始試行（マイクのみ）...");
   pendingMicRequest = true;
   updateConnectionUI();
-
-  // クリック操作の同期処理内で getDisplayMedia を開始する（ジェスチャ要件）
-  let displayPromise = null;
-  if (includeTabAudio) {
-    try {
-      displayPromise = navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-      });
-    } catch (err) {
-      pendingMicRequest = false;
-      setRecordingUI(false);
-      const msg = captureErrorMessage(err, true);
-      showStatus(msg, true);
-      return;
-    }
-  }
 
   try {
     currentStream = await buildCaptureStream(includeTabAudio, displayPromise);
@@ -362,6 +351,33 @@ async function startRecording() {
     console.error("録音エラー:", err);
     showStatus(msg, true);
   }
+}
+
+function onStartButtonClick() {
+  if (pendingMicRequest || isRecordingActive) return;
+
+  const includeTabAudio = !!(includeTabAudioEl && includeTabAudioEl.checked);
+  let displayPromise = null;
+
+  // getDisplayMedia は click ハンドラの同期処理内でのみ許可される
+  if (includeTabAudio) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      showStatus("このブラウザはタブ音声の共有に対応していません。Chrome の利用を推奨します。", true);
+      return;
+    }
+    try {
+      displayPromise = navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
+    } catch (err) {
+      console.error("録音エラー:", err);
+      showStatus(captureErrorMessage(err, true), true);
+      return;
+    }
+  }
+
+  void startRecording(includeTabAudio, displayPromise);
 }
 
 function scheduleNextChunk(delayMs = 0) {
@@ -504,7 +520,7 @@ function stopRecording() {
   send({ cmd: "stop" });
 }
 
-if (btnStart) btnStart.addEventListener("click", () => startRecording());
+if (btnStart) btnStart.addEventListener("click", onStartButtonClick);
 if (btnStop) btnStop.addEventListener("click", () => stopRecording());
 
 connectWS();
