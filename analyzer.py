@@ -17,6 +17,8 @@ from database import (
 
 ANALYSIS_DELAY_SECONDS = 5    # デバッグ用（本番は30）
 GOAL_PREDICTION_WINDOW = 30   # デバッグ用（本番は180秒）
+# Llama 3.3 70B は 2026-08-16 運用終了。Groq 推奨の本番代替。
+GROQ_CHAT_MODEL = "openai/gpt-oss-120b"
 
 
 class Analyzer:
@@ -34,7 +36,7 @@ class Analyzer:
         on_topic_callback(topic_node)                     : 話題ノード追加時
         """
         self.client = get_groq_client()
-        self.model = "llama-3.3-70b-versatile"
+        self.model = GROQ_CHAT_MODEL
         self.on_analysis_callback = on_analysis_callback
         self.on_goal_callback = on_goal_callback
         self.on_topic_callback = on_topic_callback
@@ -129,6 +131,16 @@ class Analyzer:
                 print(f"[Analyzer] 分析エラー: {e}")
                 traceback.print_exc()
 
+    def _complete(self, prompt: str) -> str:
+        """GPT-OSS の推論トレースを本文に混ぜないよう、短い最終回答だけ取る"""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            reasoning_effort="low",
+            include_reasoning=False,
+        )
+        return (response.choices[0].message.content or "").strip()
+
     def _analyze_speech(self, text: str) -> tuple[str, list[str]]:
         """発言から要約と要望（3つ）を生成する"""
         prompt = (
@@ -136,11 +148,7 @@ class Analyzer:
             '{"summary": "発言の要約（20字以内）", "intents": ["要望1", "要望2", "要望3"]}\n\n'
             f"発言：{text}"
         )
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.choices[0].message.content.strip()
+        raw = self._complete(prompt)
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         data = json.loads(raw)
@@ -154,11 +162,7 @@ class Analyzer:
             "回答は話題の名前のみ。説明不要。\n\n"
             f"発言：{text}"
         )
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.choices[0].message.content.strip()
+        return self._complete(prompt)
 
     def _update_topic_flow(self, topic_label: str) -> Optional[str]:
         """話題ノードをGit風に追加する"""
@@ -212,11 +216,7 @@ class Analyzer:
             "「yes」（自然な流れ）か「no」（逸脱・脱線）のみで回答してください。\n\n"
             f"前の話題：{prev_topic}\n現在の話題：{current_topic}"
         )
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.choices[0].message.content.strip().lower() == "no"
+        return self._complete(prompt).lower() == "no"
 
     def _predict_goal(self):
         """3分間の発言から会議の本題を予測する"""
@@ -232,11 +232,7 @@ class Analyzer:
                 "回答は本題の名前のみ。説明不要。\n\n"
                 f"{combined}"
             )
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            goal = response.choices[0].message.content.strip()
+            goal = self._complete(prompt)
             if not self._active():
                 return
             if not set_meeting_goal(goal, session_generation=self.session_generation):
